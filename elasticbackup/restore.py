@@ -46,11 +46,20 @@ def create_index(es, index, f):
     es.indices.create(index=index, body=mappings)
 
 
-def create_documents(es, index, f, batch_size=1000):
+def create_documents(es, index, f, pipelines=None, batch_size=1000):
     total = 0
 
-    for size, batch in document_batches(f, batch_size):
-        es.bulk(index=index, body=batch)
+    for size, batch, doc_type in document_batches(f, batch_size):
+        pipeline = doc_type + "-pipeline"
+        try:
+            pipelines[pipeline]
+        except KeyError:
+            pipeline = None
+
+        response = es.bulk(index=index, body=batch, pipeline=pipeline)
+        if response["errors"]:
+            print(response)
+            exit(-1)
         total += size
         log.info("uploaded %s (total: %s)", size, total)
 
@@ -58,21 +67,32 @@ def create_documents(es, index, f, batch_size=1000):
 def document_batches(fp, batch_size):
     i = 0
     batch = []
+    doc_type = None
 
     for line in fp:
         obj = json.loads(line)
+
+        if not doc_type:
+            doc_type = obj["_type"]
+
+        if doc_type != obj["_type"]:
+            yield i, batch, doc_type
+            i = 0
+            batch = []
+            doc_type = None
+
         src = obj.pop('_source')
         batch.append(json.dumps({"create": obj}))
         batch.append(json.dumps(src))
         i += 1
 
         if i >= batch_size:
-            yield i, batch
+            yield i, batch, doc_type
             i = 0
             batch = []
 
     if batch:
-        yield i, batch
+        yield i, batch, doc_type
 
 
 def main():
@@ -98,15 +118,26 @@ def main():
     if not os.path.exists(documents_path):
         return log.warn("documents path %s does not exists" % documents_path)
 
+    ingest_path = os.path.join(backup_dir, "ingest.json")
+    ingest_pipelines = {}
+    if not os.path.exists(ingest_path):
+        log.debug("No ingest file has been found")
+    else:
+        with open(ingest_path) as f:
+            ingest_pipelines = json.load(f)
+
     conn_kwargs = {}
     if args.user:
         conn_kwargs['http_auth'] = args.user
+
+    conn_kwargs["timeout"] = 300
+    conn_kwargs["retry_on_timeout"] = True
 
     es = elasticsearch.Elasticsearch([args.host], **conn_kwargs)
     if es.indices.exists(index=args.index):
         return log.warn(
             "Index %s already exists. Execute for delete: \n"
-            "curl -XDELETE %s/%s" % (args.index, args.host, args.index))
+            "curl -XDELETE %s:9200/%s" % (args.index, args.host, args.index))
 
     es.indices.create(index=args.index)
     time.sleep(1)
@@ -125,9 +156,20 @@ def main():
         for doc_type, doc_mapping in mappings["mappings"].items():
             es.indices.put_mapping(doc_type, index=args.index,
                                    body=doc_mapping)
+    time.sleep(1)
+
+    for pipeline_id, pipeline_body in ingest_pipelines.items():
+        try:
+            exists = es.ingest.get_pipeline(pipeline_id)
+            print(exists)
+        except elasticsearch.exceptions.NotFoundError:
+            es.ingest.put_pipeline(pipeline_id, pipeline_body)
 
     with open(documents_path) as f:
-        create_documents(es, args.index, f, batch_size=args.batch_size)
+        create_documents(es, args.index, f,
+                         pipelines=ingest_pipelines,
+                         batch_size=args.batch_size)
+
 
 if __name__ == '__main__':
     main()
